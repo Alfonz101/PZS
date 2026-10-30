@@ -60,21 +60,21 @@ s `--data-dir synthetic` (viz hlavička souboru). Výsledky na syntetice nejsou 
 ```mermaid
 flowchart LR
   A[EKG] --> B[Pásmová propust 5-15 Hz] --> C[Derivace] --> D[Umocnění] --> E[Klouzavý integrátor 150 ms]
-  E --> F[Kandidáti: lokální maxima]
-  F --> G{Nad adaptivním prahem?}
-  G -- ano --> H{T vlna? krátký RR a nízký sklon}
+  E --> F["Kandidáti: lokální maxima"]
+  F --> G{"Nad adaptivním prahem?"}
+  G -- ano --> H{"T vlna? krátký RR a nízký sklon"}
   H -- ne --> I[R vrchol, aktualizace SPKI]
   H -- ano --> J[Šum, aktualizace NPKI]
   G -- ne --> J
-  I --> K[Zpřesnění polohy] --> L[BPM = počet vrcholů / minuty]
+  I --> K[Zpřesnění polohy] --> L["BPM = počet vrcholů / minuty"]
 ```
 
 ```mermaid
 flowchart LR
   A[VOICED 208 záznamů] --> B[Diagnóza z .hea]
-  A --> C[Příznaky: čas, FFT, kepstrum, MFCC]
+  A --> C["Příznaky: čas, FFT, kepstrum, MFCC"]
   C --> D[Standardizace + SVM/kNN/RF]
-  D --> E{Fáze 1: zdravý / patologický}
+  D --> E{"Fáze 1: zdravý / patologický"}
   E -- patologický --> F[Fáze 2: typ poruchy]
   E -- zdravý --> G[healthy]
   F --> H[Srovnání s anotacemi expertů]
