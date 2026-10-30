@@ -1,2 +1,10 @@
 data/
 outputs/
+__pycache__/
+.venv/
+.venv_new/
+*.log
+assignments/
+feedback.md
+outputs_pdfs/
+outputs_revised.zip

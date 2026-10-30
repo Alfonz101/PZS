@@ -27,8 +27,8 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (balanced_accuracy_score, classification_report, confusion_matrix)
-from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import (balanced_accuracy_score, classification_report, confusion_matrix, roc_auc_score)
+from sklearn.model_selection import GridSearchCV, RepeatedStratifiedKFold, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -42,6 +42,14 @@ DB = "voiced"
 SEED = 42
 MIN_GROUP_SIZE = 10          # skupiny menší než toto se sloučí do "other"
 HEALTHY, PATHOLOGICAL = "healthy", "pathological"
+N_REPEATS = 10               # opakování křížové validace pro odhad rozptylu úspěšnosti
+# české popisky do grafů a tabulek (interně se pracuje s anglickými názvy z hlaviček)
+CZ = {"healthy": "zdravý", "pathological": "patologický", "hyperkinetic dysphonia": "hyperkinetická dysfonie",
+      "hypokinetic dysphonia": "hypokinetická dysfonie", "reflux laryngitis": "reflux laryngitis", "other": "ostatní"}
+
+
+def cz(label: str) -> str:
+    return CZ.get(label, label)
 
 
 # --------------------------------------------------------------------------
@@ -65,6 +73,15 @@ def parse_diagnosis(comments: list[str]) -> str | None:
     return None
 
 
+def parse_sex(comments: list[str]) -> str | None:
+    """Pohlaví z komentáře hlavičky ('<sex>: F') – jen pro kontrolu F0, není to příznak klasifikace."""
+    for line in comments:
+        match = re.search(r"<sex>\s*:\s*([MF])", line, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    return None
+
+
 def build_feature_table(data_dir, cache: Path, reuse: bool) -> pd.DataFrame:
     if reuse and cache.exists():
         return pd.read_csv(cache)
@@ -72,9 +89,10 @@ def build_feature_table(data_dir, cache: Path, reuse: bool) -> pd.DataFrame:
     records = [r for r in physio.list_records(DB, data_dir) if r.startswith("voice")]
     print(f"Počet záznamů: {len(records)}")
     for i, rec in enumerate(records, 1):
-        diagnosis = parse_diagnosis(physio.read_comments(rec, DB, data_dir))
+        comments = physio.read_comments(rec, DB, data_dir)
+        diagnosis = parse_diagnosis(comments)
         signal, fs = physio.read_signal(rec, DB, "voice", data_dir)
-        rows.append({"record": rec, "diagnosis": diagnosis, **extract_features(signal, fs)})
+        rows.append({"record": rec, "diagnosis": diagnosis, "sex": parse_sex(comments), **extract_features(signal, fs)})
         print(f"[{i}/{len(records)}] {rec}: {diagnosis}")
     df = pd.DataFrame(rows)
     df.to_csv(cache, index=False)
@@ -97,19 +115,27 @@ def add_labels(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # Klasifikace
 # --------------------------------------------------------------------------
-N_BEST_STAGE1 = 8     # počet příznaků vybraných uvnitř CV ve fázi 1 (zdravý/patologický)
+K_GRID = [5, 8, 12, "all"]   # prohledávaný prostor počtu příznaků ve vnitřní CV
 
 
-def make_model(name: str, k_best: int | None = None):
+def _param_grid(name: str) -> dict:
+    return {
+        "SVM (RBF)": {"selectkbest__k": K_GRID, "svc__C": [1, 3, 10]},
+        "kNN (k=5)": {"selectkbest__k": K_GRID, "kneighborsclassifier__n_neighbors": [3, 5, 7]},
+        "Random forest": {"selectkbest__k": K_GRID},
+    }[name]
+
+
+def make_model(name: str) -> GridSearchCV:
+    """Pipeline uvnitř zanořeného GridSearchCV: k příznaků i hyperparametr klasifikátoru se ladí
+    na trénovací části každého foldu vnější CV – žádný únik informace z testovací části."""
     clf = {
         "SVM (RBF)": SVC(C=3, gamma="scale", class_weight="balanced", random_state=SEED),
         "kNN (k=5)": KNeighborsClassifier(n_neighbors=5, weights="distance"),
         "Random forest": RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=SEED),
     }[name]
-    steps = [SimpleImputer(strategy="median"), StandardScaler()]
-    if k_best:  # výběr příznaků probíhá jen na trénovací části každého foldu (bez úniku informace)
-        steps.append(SelectKBest(f_classif, k=k_best))
-    return make_pipeline(*steps, clf)
+    pipe = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), SelectKBest(f_classif, k=8), clf)
+    return GridSearchCV(pipe, _param_grid(name), cv=3, scoring="balanced_accuracy", refit=True, n_jobs=-1)
 
 
 MODEL_NAMES = ["SVM (RBF)", "kNN (k=5)", "Random forest"]
@@ -120,25 +146,56 @@ def safe_splits(y: np.ndarray, n_splits: int) -> int:
     return max(2, min(n_splits, int(pd.Series(y).value_counts().min())))
 
 
-def cv_predict(model_name: str, X: pd.DataFrame, y: np.ndarray, n_splits: int, k_best: int | None = None) -> np.ndarray:
+def cv_predict(model_name: str, X: pd.DataFrame, y: np.ndarray, n_splits: int) -> np.ndarray:
     pred = np.empty(len(y), dtype=object)
     n_splits = safe_splits(y, n_splits)
     cv = StratifiedKFold(n_splits, shuffle=True, random_state=SEED)
     for train, test in cv.split(X, y):
-        model = make_model(model_name, k_best).fit(X.iloc[train], y[train])
+        model = make_model(model_name).fit(X.iloc[train], y[train])
         pred[test] = model.predict(X.iloc[test])
     return pred
 
 
-def compare_models(X, y, n_splits, title, k_best=None) -> tuple[str, pd.DataFrame]:
+def repeated_scores(model_name: str, X: pd.DataFrame, y: np.ndarray, n_splits: int):
+    """Přesnost a vyvážená přesnost z opakované stratifikované CV -> (pole acc, pole bacc), hodnota za opakování."""
+    n_splits = safe_splits(y, n_splits)
+    cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=N_REPEATS, random_state=SEED)
+    acc, bacc = [], []
+    pred = np.empty(len(y), dtype=object)
+    for i, (train, test) in enumerate(cv.split(X, y)):
+        pred[test] = make_model(model_name).fit(X.iloc[train], y[train]).predict(X.iloc[test])
+        if (i + 1) % n_splits == 0:       # konec jednoho opakování = predikce pro všechny nahrávky
+            acc.append(np.mean(pred == y)); bacc.append(balanced_accuracy_score(y, pred))
+    return 100 * np.array(acc), 100 * np.array(bacc)
+
+
+def compare_models(X, y, n_splits, title) -> tuple[str, pd.DataFrame]:
+    """Srovnání modelů: jedno rozdělení (semínko SEED) a průměr ± sm. odchylka přes N_REPEATS opakování CV.
+
+    Nejlepší model se vybírá podle průměrné vyvážené přesnosti z opakované CV (stabilnější než jedno rozdělení).
+    """
     rows = []
     for name in MODEL_NAMES:
-        pred = cv_predict(name, X, y, n_splits, k_best)
+        pred = cv_predict(name, X, y, n_splits)
+        acc, bacc = repeated_scores(name, X, y, n_splits)
         rows.append({"model": name, "accuracy_%": 100 * np.mean(pred == y),
-                     "balanced_accuracy_%": 100 * balanced_accuracy_score(y, pred)})
+                     "balanced_accuracy_%": 100 * balanced_accuracy_score(y, pred),
+                     "accuracy_mean_%": acc.mean(), "accuracy_std_%": acc.std(),
+                     "balanced_accuracy_mean_%": bacc.mean(), "balanced_accuracy_std_%": bacc.std()})
     table = pd.DataFrame(rows)
     print(f"\n{title}\n{table.round(2).to_string(index=False)}")
-    return table.loc[table["balanced_accuracy_%"].idxmax(), "model"], table
+    return table.loc[table["balanced_accuracy_mean_%"].idxmax(), "model"], table
+
+
+def feature_auc(X: pd.DataFrame, y_bin: np.ndarray) -> pd.DataFrame:
+    """ROC AUC jednotlivých příznaků pro zdravý x patologický (max(AUC, 1-AUC), na směru nezáleží)."""
+    target = (y_bin == PATHOLOGICAL).astype(int)
+    rows = []
+    for col in X:
+        ok = X[col].notna().to_numpy()
+        auc = roc_auc_score(target[ok], X.loc[ok, col])
+        rows.append({"feature": col, "AUC": max(auc, 1 - auc), "higher_in": PATHOLOGICAL if auc >= 0.5 else HEALTHY})
+    return pd.DataFrame(rows).sort_values("AUC", ascending=False).reset_index(drop=True)
 
 
 def cascade_predict(model1: str, model2: str, X: pd.DataFrame, df: pd.DataFrame, n_splits: int) -> np.ndarray:
@@ -147,9 +204,9 @@ def cascade_predict(model1: str, model2: str, X: pd.DataFrame, df: pd.DataFrame,
     pred = np.empty(len(df), dtype=object)
     cv = StratifiedKFold(safe_splits(y_grp, n_splits), shuffle=True, random_state=SEED)
     for train, test in cv.split(X, y_grp):
-        stage1 = make_model(model1, N_BEST_STAGE1).fit(X.iloc[train], y_bin[train])
+        stage1 = make_model(model1).fit(X.iloc[train], y_bin[train])
         path_train = train[y_bin[train] == PATHOLOGICAL]
-        stage2 = make_model(model2).fit(X.iloc[path_train], y_grp[path_train])
+        stage2 = make_model(model2).fit(X.iloc[path_train], y_grp[path_train])  # zanořená CV ladí k i hyperparametry
         p1 = stage1.predict(X.iloc[test])
         out = np.full(len(test), HEALTHY, dtype=object)
         sick = p1 == PATHOLOGICAL
@@ -168,7 +225,7 @@ def plot_confusion(y, pred, labels, title, path: Path):
     ax.imshow(cm, cmap="Blues")
     for i, j in np.ndindex(cm.shape):
         ax.text(j, i, cm[i, j], ha="center", va="center", color="white" if cm[i, j] > cm.max() / 2 else "black")
-    short = [l if len(l) < 22 else l[:20] + "…" for l in labels]
+    short = [cz(l) for l in labels]
     ax.set_xticks(range(len(labels)), short, rotation=40, ha="right")
     ax.set_yticks(range(len(labels)), short)
     ax.set(xlabel="Predikce", ylabel="Anotace expertů", title=title)
@@ -183,7 +240,7 @@ def plot_pca(X: pd.DataFrame, df: pd.DataFrame, path: Path):
     for ax, col in zip(axes, ["binary", "group"]):
         for label in sorted(df[col].unique()):
             m = (df[col] == label).to_numpy()
-            ax.scatter(P[m, 0], P[m, 1], s=22, alpha=0.75, label=f"{label} ({m.sum()})")
+            ax.scatter(P[m, 0], P[m, 1], s=22, alpha=0.75, label=f"{cz(label)} ({m.sum()})")
         ax.set(xlabel=f"PC1 ({100 * pca.explained_variance_ratio_[0]:.1f} %)",
                ylabel=f"PC2 ({100 * pca.explained_variance_ratio_[1]:.1f} %)",
                title="PCA příznaků: " + ("zdravý/patologický" if col == "binary" else "skupiny poruch"))
@@ -197,8 +254,8 @@ def plot_feature_boxplots(X: pd.DataFrame, df: pd.DataFrame, path: Path):
     groups = sorted(df["group"].unique())
     fig, axes = plt.subplots(2, 3, figsize=(14, 7))
     for ax, name in zip(axes.ravel(), names):
-        ax.boxplot([X.loc[df["group"] == g, name].dropna() for g in groups], tick_labels=[g[:14] for g in groups])
-        ax.set_title(name); ax.tick_params(axis="x", rotation=30, labelsize=7); ax.grid(axis="y", alpha=0.3)
+        ax.boxplot([X.loc[df["group"] == g, name].dropna() for g in groups], tick_labels=[cz(g).replace(" ", "\n", 1) for g in groups])
+        ax.set_title(name); ax.tick_params(axis="x", labelsize=8); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
 
 
@@ -225,12 +282,14 @@ def plot_examples(df: pd.DataFrame, data_dir, path: Path):
 def per_group_table(y, pred, labels) -> pd.DataFrame:
     report = classification_report(y, pred, labels=labels, output_dict=True, zero_division=0)
     table = pd.DataFrame({l: report[l] for l in labels}).T
+    table.index = [cz(l) for l in labels]
     table["recall"] *= 100; table["precision"] *= 100; table["f1-score"] *= 100
     table.columns = ["precision_%", "recall_% (úspěšnost)", "f1_%", "počet"]
     return table
 
 
 def main():
+    physio.utf8_stdout()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--out", default="outputs/sem2")
@@ -240,18 +299,29 @@ def main():
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
 
     df = add_labels(build_feature_table(args.data_dir, out / "priznaky.csv", args.reuse))
-    X = df.drop(columns=["record", "diagnosis", "binary", "group"])
+    X = df.drop(columns=["record", "diagnosis", "sex", "binary", "group"], errors="ignore")
+    if "sex" in df:   # kontrola věrohodnosti F0 (oktávové chyby by se projevily nízkou F0 u žen)
+        f0 = df.groupby("sex")["f0_mean"].median()
+        low = int(((df["sex"] == "F") & (df["f0_mean"] < 140)).sum())
+        print(f"\nMedián F0: ženy {f0.get('F', np.nan):.0f} Hz, muži {f0.get('M', np.nan):.0f} Hz; "
+              f"ženy s F0 < 140 Hz: {low} z {int((df['sex'] == 'F').sum())}; "
+              f"medián sm. odchylky F0 v nahrávce {df['f0_std'].median():.1f} Hz")
     print("\nDiagnózy:\n", df["diagnosis"].value_counts().to_string())
     print("\nSkupiny po sloučení:\n", df["group"].value_counts().to_string())
 
     plot_examples(df, args.data_dir, out / "ukazka_signalu_spektra_kepstra.png")
     plot_pca(X, df, out / "pca.png")
     plot_feature_boxplots(X, df, out / "boxploty_priznaku.png")
+    auc = feature_auc(X, df["binary"].to_numpy())
+    auc.round(3).to_csv(out / "auc_priznaku.csv", index=False)
+    print("\nNejlepší jednotlivé příznaky (AUC zdravý x patologický):\n", auc.head(8).round(3).to_string(index=False))
+    X.groupby(df["group"].map(cz)).median().T.round(4).to_csv(out / "mediany_priznaku_po_skupinach.csv")
+    print(f"Nahrávky s chybějícím jitterem/shimmerem: {int(X['jitter_local'].isna().sum())}")
 
     # fáze 1
-    best1, t1 = compare_models(X, df["binary"].to_numpy(), args.folds, "FÁZE 1: zdravý x patologický", N_BEST_STAGE1)
+    best1, t1 = compare_models(X, df["binary"].to_numpy(), args.folds, "FÁZE 1: zdravý x patologický")
     t1.round(2).to_csv(out / "faze1_modely.csv", index=False)
-    pred1 = cv_predict(best1, X, df["binary"].to_numpy(), args.folds, N_BEST_STAGE1)
+    pred1 = cv_predict(best1, X, df["binary"].to_numpy(), args.folds)
     labels1 = [HEALTHY, PATHOLOGICAL]
     plot_confusion(df["binary"], pred1, labels1, f"Fáze 1 – {best1}", out / "faze1_matice_zamen.png")
     per_group_table(df["binary"], pred1, labels1).round(2).to_csv(out / "faze1_uspesnost.csv")
@@ -259,7 +329,7 @@ def main():
     # fáze 2 (jen patologické)
     sick = df["binary"] == PATHOLOGICAL
     Xs, ys = X[sick].reset_index(drop=True), df.loc[sick, "group"].to_numpy()
-    best2, t2 = compare_models(Xs, ys, args.folds, "FÁZE 2: typ poruchy (jen patologické)")
+    best2, t2 = compare_models(Xs, ys, args.folds, "FÁZE 2: typ poruchy (jen patologické)")  # k_best ladí zanořená CV
     t2.round(2).to_csv(out / "faze2_modely.csv", index=False)
 
     # kaskáda

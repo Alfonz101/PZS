@@ -1,0 +1,48 @@
+% Společné nastavení pro protokoly KI/PZS (pdfLaTeX, Overleaf výchozí kompilátor)
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[czech]{babel}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=2pt,topsep=4pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+% Záporné znaménko v textových tabulkách: \m0,5 -> −0,5
+\newcommand{\m}{$-$}
+
+% Červená značka pro místa, která je třeba před odevzdáním doplnit
+\newcommand{\doplnit}[1]{\textcolor{red}{\textbf{[DOPLNIT: #1]}}}
+
+% Obrázek, který se zobrazí, jakmile je soubor nahrán; do té doby červený zástupce
+\newcommand{\obrazekNeboZastupce}[3]{%
+  \IfFileExists{#1}{\includegraphics[width=#2]{#1}}{%
+    \fbox{\parbox[c][4cm][c]{\dimexpr#2-2\fboxsep-2\fboxrule\relax}{\centering\doplnit{#3}}}}}
+
+% Styl vývojových diagramů
+\tikzset{
+  krok/.style={draw, rounded corners=3pt, minimum width=3.3cm, minimum height=1.15cm,
+               align=center, font=\small, line width=0.5pt, draw=black!60},
+  hlavni/.style={krok, draw=blue!70!black, fill=blue!8, line width=0.9pt},
+  rozhodnuti/.style={draw, diamond, aspect=2.4, align=center, font=\small,
+               inner sep=1pt, line width=0.5pt, draw=black!60},
+  sipka/.style={-{Stealth[length=2.6mm]}, line width=0.5pt, draw=black!60},
+  popisek/.style={font=\footnotesize, text=black!70}
+}

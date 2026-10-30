@@ -1,6 +1,8 @@
-numpy
-scipy
-pandas
-matplotlib
-scikit-learn
-wfdb
+# Verze, se kterými byly vytvořeny výsledky v protokolech
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.1.0
+matplotlib==3.11.2
+scikit-learn==1.9.1
+wfdb==4.3.1
+requests==2.34.2

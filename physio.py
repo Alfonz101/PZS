@@ -9,6 +9,8 @@ Síťové čtení se při výpadku spojení automaticky opakuje (_retry).
 """
 from __future__ import annotations
 
+import re
+import sys
 import time
 from pathlib import Path
 
@@ -20,6 +22,13 @@ import wfdb
 BEAT_SYMBOLS = set("NLRBAaJSVrFejnE/fQ?")
 
 NETWORK_ERRORS = (requests.exceptions.RequestException, ConnectionError, TimeoutError)
+
+
+def utf8_stdout() -> None:
+    """Výpisy s diakritikou nespadnou ani na Windows při přesměrování výstupu do souboru/roury."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
 
 
 def _retry(func, *args, attempts: int = 6, **kwargs):
@@ -41,11 +50,18 @@ def _where(record: str, db: str, data_dir: str | None) -> dict:
     return {"record_name": record, "pn_dir": db}
 
 
+def _natural_key(name: str) -> list:
+    """Klíč pro přirozené řazení (charis2 před charis10)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
 def list_records(db: str, data_dir: str | None = None) -> list[str]:
-    """Seznam názvů záznamů v databázi."""
+    """Seznam názvů záznamů v databázi (přirozeně seřazený)."""
     if data_dir:
-        return sorted(p.stem for p in (Path(data_dir) / db).glob("*.hea"))
-    return _retry(wfdb.get_record_list, db)
+        names = [p.stem for p in (Path(data_dir) / db).glob("*.hea")]
+    else:
+        names = _retry(wfdb.get_record_list, db)
+    return sorted(names, key=_natural_key)
 
 
 def read_header(record: str, db: str, data_dir: str | None = None) -> wfdb.Record:

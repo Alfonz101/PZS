@@ -15,6 +15,7 @@ from dsp import (autocorrelation, frame_signal, interpolate_nans, lowpass,
 
 F0_MIN, F0_MAX = 70.0, 400.0
 VOICED_THRESHOLD = 0.3
+OCTAVE_RATIO = 0.9    # kandidát na periodu musí mít alespoň tento podíl maxima autokorelace (1.0 = prosté argmax)
 N_MFCC = 12
 
 
@@ -41,8 +42,14 @@ def pitch_and_hnr(x: np.ndarray, fs: float, frame_ms: float = 40.0, hop_ms: floa
         r = autocorrelation(frame * np.hanning(size))
         r = r / np.maximum(autocorrelation(np.hanning(size)), 1e-6)  # korekce vlivu okna
         seg = r[lag_lo:lag_hi + 1]
-        k = int(np.argmax(seg)) + lag_lo
-        if seg.max() < VOICED_THRESHOLD or k <= 0 or k >= size - 1:
+        if seg.max() < VOICED_THRESHOLD:
+            continue
+        # Prosté argmax volí často násobek periody (r(2T) ≈ r(T), korekce oknem dlouhá zpoždění ještě
+        # zesiluje) -> F0 o oktávu níž. Bere se proto první lokální maximum s výškou >= 90 % maxima.
+        peaks, _ = find_peaks(seg)
+        strong = peaks[seg[peaks] >= OCTAVE_RATIO * seg.max()] if peaks.size else []
+        k = int(strong[0] if len(strong) else np.argmax(seg)) + lag_lo
+        if k <= 0 or k >= size - 1:
             continue
         # parabolická interpolace píku
         a, b, c = r[k - 1], r[k], r[k + 1]
